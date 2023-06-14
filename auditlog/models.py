@@ -2,7 +2,7 @@ import ast
 import json
 from copy import deepcopy
 from datetime import timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
 from dateutil import parser
 from dateutil.tz import gettz
@@ -10,10 +10,15 @@ from django.conf import settings
 from django.contrib.contenttypes.fields import GenericRelation
 from django.contrib.contenttypes.models import ContentType
 from django.core import serializers
-from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import (
+    FieldDoesNotExist,
+    ObjectDoesNotExist,
+    ValidationError,
+)
 from django.db import DEFAULT_DB_ALIAS, models
 from django.db.models import Q, QuerySet
 from django.utils import formats
+from django.utils import timezone as django_timezone
 from django.utils.encoding import smart_str
 from django.utils.translation import gettext_lazy as _
 
@@ -25,21 +30,25 @@ class LogEntryManager(models.Manager):
     Custom manager for the :py:class:`LogEntry` model.
     """
 
-    def log_create(self, instance, **kwargs):
+    def log_create(self, instance, force_log: bool = False, **kwargs):
         """
         Helper method to create a new log entry. This method automatically populates some fields when no
         explicit value is given.
 
         :param instance: The model instance to log a change for.
         :type instance: Model
+        :param force_log: Create a LogEntry even if no changes exist.
+        :type force_log: bool
         :param kwargs: Field overrides for the :py:class:`LogEntry` object.
         :return: The new log entry or `None` if there were no changes.
         :rtype: LogEntry
         """
+        from auditlog.cid import get_cid
+
         changes = kwargs.get("changes", None)
         pk = self._get_pk_value(instance)
 
-        if changes is not None:
+        if changes is not None or force_log:
             kwargs.setdefault(
                 "content_type", ContentType.objects.get_for_model(instance)
             )
@@ -75,6 +84,9 @@ class LogEntryManager(models.Manager):
                         content_type=kwargs.get("content_type"),
                         object_pk=kwargs.get("object_pk", ""),
                     ).delete()
+
+            # set correlation id
+            kwargs.setdefault("cid", get_cid())
             return self.create(**kwargs)
         return None
 
@@ -95,6 +107,7 @@ class LogEntryManager(models.Manager):
         :return: The new log entry or `None` if there were no changes.
         :rtype: LogEntry
         """
+        from auditlog.cid import get_cid
 
         pk = self._get_pk_value(instance)
         if changed_queryset is not None:
@@ -113,15 +126,15 @@ class LogEntryManager(models.Manager):
                 kwargs.setdefault("additional_data", get_additional_data())
 
             objects = [smart_str(instance) for instance in changed_queryset]
-            kwargs["changes"] = json.dumps(
-                {
-                    field_name: {
-                        "type": "m2m",
-                        "operation": operation,
-                        "objects": objects,
-                    }
+            kwargs["changes"] = {
+                field_name: {
+                    "type": "m2m",
+                    "operation": operation,
+                    "objects": objects,
                 }
-            )
+            }
+
+            kwargs.setdefault("cid", get_cid())
             return self.create(**kwargs)
 
         return None
@@ -342,7 +355,7 @@ class LogEntry(models.Model):
     action = models.PositiveSmallIntegerField(
         choices=Action.choices, verbose_name=_("action"), db_index=True
     )
-    changes = models.TextField(blank=True, verbose_name=_("change message"))
+    changes = models.JSONField(null=True, verbose_name=_("change message"))
     actor = models.ForeignKey(
         to=settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -351,11 +364,20 @@ class LogEntry(models.Model):
         related_name="+",
         verbose_name=_("actor"),
     )
+    cid = models.CharField(
+        max_length=255,
+        db_index=True,
+        blank=True,
+        null=True,
+        verbose_name=_("Correlation ID"),
+    )
     remote_addr = models.GenericIPAddressField(
         blank=True, null=True, verbose_name=_("remote address")
     )
     timestamp = models.DateTimeField(
-        db_index=True, auto_now_add=True, verbose_name=_("timestamp")
+        default=django_timezone.now,
+        db_index=True,
+        verbose_name=_("timestamp"),
     )
     additional_data = models.JSONField(
         blank=True, null=True, verbose_name=_("additional data")
@@ -386,10 +408,7 @@ class LogEntry(models.Model):
         """
         :return: The changes recorded in this log entry as a dictionary object.
         """
-        try:
-            return json.loads(self.changes)
-        except ValueError:
-            return {}
+        return self.changes or {}
 
     @property
     def changes_str(self, colon=": ", arrow=" \u2192 ", separator="; "):
@@ -479,6 +498,9 @@ class LogEntry(models.Model):
                             value = formats.localize(value)
                         except ValueError:
                             pass
+                    elif field_type in ["ForeignKey", "OneToOneField"]:
+                        value = self._get_changes_display_for_fk_field(field, value)
+
                     # check if length is longer than 140 and truncate with ellipsis
                     if len(value) > 140:
                         value = f"{value[:140]}..."
@@ -489,6 +511,31 @@ class LogEntry(models.Model):
             )
             changes_display_dict[verbose_name] = values_display
         return changes_display_dict
+
+    def _get_changes_display_for_fk_field(
+        self, field: Union[models.ForeignKey, models.OneToOneField], value: Any
+    ) -> str:
+        """
+        :return: A string representing a given FK value and the field to which it belongs
+        """
+        # Return "None" if the FK value is "None".
+        if value == "None":
+            return value
+
+        # Attempt to convert given value to the PK type for the related model
+        try:
+            pk_value = field.related_model._meta.pk.to_python(value)
+        # ValidationError will handle legacy values where string representations were
+        # stored rather than PKs. This will also handle cases where the PK type is
+        # changed between the time the LogEntry is created and this method is called.
+        except ValidationError:
+            return value
+        # Attempt to return the string representation of the object
+        try:
+            return smart_str(field.related_model.objects.get(pk=pk_value))
+        # ObjectDoesNotExist will be raised if the object was deleted.
+        except ObjectDoesNotExist:
+            return f"Deleted '{field.related_model.__name__}' ({value})"
 
 
 class AuditlogHistoryField(GenericRelation):

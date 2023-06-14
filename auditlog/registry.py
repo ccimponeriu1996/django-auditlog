@@ -113,6 +113,9 @@ class AuditlogModelRegistry:
                 "set. Did you forget to set serialized_data to True?"
             )
 
+        for fld in settings.AUDITLOG_EXCLUDE_TRACKING_FIELDS:
+            exclude_fields.append(fld)
+
         def registrar(cls):
             """Register models for a given class."""
             if not issubclass(cls, Model):
@@ -247,7 +250,8 @@ class AuditlogModelRegistry:
     ) -> List[ModelBase]:
         exclude_models = [
             model
-            for app_model in exclude_tracking_models + self.DEFAULT_EXCLUDE_MODELS
+            for app_model in tuple(exclude_tracking_models)
+            + self.DEFAULT_EXCLUDE_MODELS
             for model in self._get_model_classes(app_model)
         ]
         return exclude_models
@@ -260,7 +264,13 @@ class AuditlogModelRegistry:
                     self.unregister(model_class)
                     self.register(model_class)
             elif isinstance(model, dict):
-                model["model"] = self._get_model_classes(model["model"])[0]
+                appmodel = self._get_model_classes(model["model"])
+                if not appmodel:
+                    raise AuditLogRegistrationError(
+                        f"An error was encountered while registering model '{model['model']}' - "
+                        "make sure the app is registered correctly."
+                    )
+                model["model"] = appmodel[0]
                 self.unregister(model["model"])
                 self.register(**model)
 
@@ -286,9 +296,23 @@ class AuditlogModelRegistry:
                 "setting 'AUDITLOG_INCLUDE_ALL_MODELS' must set to 'True'"
             )
 
+        if (
+            settings.AUDITLOG_EXCLUDE_TRACKING_FIELDS
+            and not settings.AUDITLOG_INCLUDE_ALL_MODELS
+        ):
+            raise ValueError(
+                "In order to use 'AUDITLOG_EXCLUDE_TRACKING_FIELDS', "
+                "setting 'AUDITLOG_INCLUDE_ALL_MODELS' must be set to 'True'"
+            )
+
         if not isinstance(settings.AUDITLOG_INCLUDE_TRACKING_MODELS, (list, tuple)):
             raise TypeError(
                 "Setting 'AUDITLOG_INCLUDE_TRACKING_MODELS' must be a list or tuple"
+            )
+
+        if not isinstance(settings.AUDITLOG_EXCLUDE_TRACKING_FIELDS, (list, tuple)):
+            raise TypeError(
+                "Setting 'AUDITLOG_EXCLUDE_TRACKING_FIELDS' must be a list or tuple"
             )
 
         for item in settings.AUDITLOG_INCLUDE_TRACKING_MODELS:

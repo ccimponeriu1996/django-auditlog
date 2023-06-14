@@ -1,10 +1,10 @@
 import json
-
 from datetime import timezone
+from typing import Optional
 
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import NOT_PROVIDED, DateTimeField, JSONField, Model
+from django.db.models import NOT_PROVIDED, DateTimeField, ForeignKey, JSONField, Model
 from django.utils import timezone as django_timezone
 from django.utils.encoding import smart_str
 
@@ -105,7 +105,9 @@ def mask_str(value: str) -> str:
     return "*" * mask_limit + value[mask_limit:]
 
 
-def model_instance_diff(old, new, fields_to_check=None):
+def model_instance_diff(
+    old: Optional[Model], new: Optional[Model], fields_to_check=None
+):
     """
     Calculates the differences between two model instances. One of the instances may be ``None``
     (i.e., a newly created model or deleted model). This will cause all fields with a value to have
@@ -145,7 +147,14 @@ def model_instance_diff(old, new, fields_to_check=None):
         model_fields = None
 
     if fields_to_check:
-        fields = {field for field in fields if field.name in fields_to_check}
+        fields = {
+            field
+            for field in fields
+            if (
+                (isinstance(field, ForeignKey) and field.attname in fields_to_check)
+                or (field.name in fields_to_check)
+            )
+        }
 
     # Check if fields must be filtered
     if (

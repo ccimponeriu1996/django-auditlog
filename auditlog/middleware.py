@@ -1,5 +1,6 @@
-import contextlib
+from django.contrib.auth import get_user_model
 
+from auditlog.cid import set_cid
 from auditlog.context import set_actor
 
 
@@ -29,13 +30,18 @@ class AuditlogMiddleware:
 
         return remote_addr
 
+    @staticmethod
+    def _get_actor(request):
+        user = getattr(request, "user", None)
+        if isinstance(user, get_user_model()) and user.is_authenticated:
+            return user
+        return None
+
     def __call__(self, request):
         remote_addr = self._get_remote_addr(request)
+        user = self._get_actor(request)
 
-        if hasattr(request, "user") and request.user.is_authenticated:
-            context = set_actor(actor=request.user, remote_addr=remote_addr)
-        else:
-            context = contextlib.nullcontext()
+        set_cid(request)
 
-        with context:
+        with set_actor(actor=user, remote_addr=remote_addr):
             return self.get_response(request)
